@@ -1,0 +1,2 @@
+mitmproxy==10.1.6
+pymongo==4.6.1
