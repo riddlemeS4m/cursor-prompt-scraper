@@ -1,0 +1,22 @@
+services:
+  cursor-proxy:
+    build: .
+    container_name: cursor-proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./logs:/app/logs
+      - ./certs:/app/certs
+    environment:
+      - MONGO_URI=${MONGO_URI}
+      - MONGO_DB=${MONGO_DB:-cursor_logs}
+      - MONGO_COLLECTION=${MONGO_COLLECTION:-api_requests}
+      - MONGO_TIMEOUT_MS=${MONGO_TIMEOUT_MS:-5000}
+      - PRODUCTION_MODE=${PRODUCTION_MODE:-true}
+    networks:
+      - cursor-net
+
+networks:
+  cursor-net:
+    driver: bridge
