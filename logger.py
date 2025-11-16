@@ -9,22 +9,22 @@ import json
 import os
 import re
 import string
+from dotenv import load_dotenv
 from mitmproxy import http
 from pathlib import Path
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
+from mongo_client import MongoDBClient
 
-# Configuration from environment variables
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://sam-desktop:27017")
-MONGO_DB = os.getenv("MONGO_DB", "cursor_logs")
-MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "api_requests")
-MONGO_TIMEOUT_MS = int(os.getenv("MONGO_TIMEOUT_MS", "5000"))
-PRODUCTION_MODE = os.getenv("PRODUCTION_MODE", "false").lower() == "true"
+# Load environment variables
+load_dotenv()
+
+# Logging Configuration
+ENABLE_FILE_LOGGING = os.getenv("ENABLE_FILE_LOGGING", "true").lower() in ("true", "1", "yes", "on")
+ENABLE_CONSOLE_LOGGING = os.getenv("ENABLE_CONSOLE_LOGGING", "true").lower() in ("true", "1", "yes", "on")
 
 class CursorLogger:
     def __init__(self):
-        self.log_dir = Path("/app/logs")  # Docker volume mount
+        self.log_dir = Path("logs")
         self.log_dir.mkdir(exist_ok=True)
         self.session_start = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.raw_log = self.log_dir / f"raw_{self.session_start}.log"
@@ -33,64 +33,38 @@ class CursorLogger:
         self.json_log = self.log_dir / f"json_{self.session_start}.log"
         self.request_count = 0
         
+        # Logging configuration
+        self.file_logging_enabled = ENABLE_FILE_LOGGING
+        self.console_logging_enabled = ENABLE_CONSOLE_LOGGING
+        
         # Regex used to extract JSON objects (lenient, dotall)
         self.json_regex_str = r'(?s)\{\s*"root"\s*:\s*\{.*?\}\s*\}'
         self.json_regex = re.compile(self.json_regex_str, re.DOTALL)
         
-        # Initialize MongoDB connection
-        self.mongo_client: Optional[MongoClient] = None
-        self.mongo_collection = None
-        self.mongo_connected = False
+        # Initialize MongoDB client with de-duplication logic
+        self.mongo_client = MongoDBClient()
         
-        if not PRODUCTION_MODE:
-            print(f"\n🚀 Cursor API Logger Started")
-            print(f"📁 Session: {self.session_start}")
-            print(f"📁 Log directory: {self.log_dir}")
-            print(f"🔧 MongoDB URI: {MONGO_URI}")
-            print(f"🔧 Production mode: {PRODUCTION_MODE}")
+        self._log(f"\n🚀 Cursor API Logger Started")
+        self._log(f"📁 Session: {self.session_start}")
+        self._log(f"📄 File logging: {'ENABLED' if self.file_logging_enabled else 'DISABLED'}")
+        self._log(f"💬 Console logging: {'ENABLED' if self.console_logging_enabled else 'DISABLED'}")
         
-        # Try to connect to MongoDB
-        self._connect_mongodb()
-        if not PRODUCTION_MODE:
-            print("-" * 50)
+        if self.file_logging_enabled:
+            self._log(f"📁 Raw log: {self.raw_log}")
+            self._log(f"📁 Binary log: {self.binary_log} (pure protobuf)")
+            self._log(f"📁 Clean log: {self.clean_log}")
+            self._log(f"📁 JSON log: {self.json_log}")
+        
+        # Try to connect to MongoDB and log session start
+        if self.mongo_client.connect():
+            self.mongo_client.log_session_start(self.session_start)
+        
+        self._log("-" * 50)
     
-    def _connect_mongodb(self):
-        """Establish connection to MongoDB"""
-        try:
-            if not PRODUCTION_MODE:
-                print(f"\n🔗 Connecting to MongoDB: {MONGO_URI}...")
-            
-            self.mongo_client = MongoClient(
-                MONGO_URI,
-                serverSelectionTimeoutMS=MONGO_TIMEOUT_MS
-            )
-            
-            # Test connection
-            self.mongo_client.admin.command('ping')
-            
-            # Get database and collection
-            db = self.mongo_client[MONGO_DB]
-            self.mongo_collection = db[MONGO_COLLECTION]
-            
-            self.mongo_connected = True
-            if not PRODUCTION_MODE:
-                print(f"✅ MongoDB connected! Database: {MONGO_DB}, Collection: {MONGO_COLLECTION}")
-            
-            # Log session start
-            self.mongo_collection.insert_one({
-                "type": "session_start",
-                "session_id": self.session_start,
-                "timestamp": datetime.datetime.now(),
-                "source": "cursor_logger"
-            })
-            
-        except (ServerSelectionTimeoutError, ConnectionFailure) as e:
-            print(f"⚠️  MongoDB connection failed: {e}")
-            print("   Continuing with file logging only...")
-            self.mongo_connected = False
-        except Exception as e:
-            print(f"⚠️  Unexpected MongoDB error: {e}")
-            self.mongo_connected = False
+    def _log(self, message: str):
+        """Conditional console logging based on environment variable"""
+        if self.console_logging_enabled:
+            print(message)
     
     def filter_printable(self, text: str) -> str:
         """Filter out non-printable characters, keeping only readable text"""
@@ -140,88 +114,122 @@ class CursorLogger:
         return texts
     
     def save_to_mongodb(self, request_num: int, timestamp: datetime.datetime, 
-                        json_objects: List[Dict[str, Any]], raw_text: str):
-        """Save request data to MongoDB"""
-        if not self.mongo_connected or self.mongo_collection is None:
+                        json_objects: List[Dict[str, Any]], raw_text: str, endpoint: str):
+        """Save request data to MongoDB with strict de-duplication"""
+        if not self.mongo_client.connected:
             return
         
         try:
-            # Prepare document
-            doc = {
-                "session_id": self.session_start,
-                "request_number": request_num,
-                "timestamp": timestamp,
-                "type": "api_request",
-                "endpoint": "aiserver.v1.ChatService/WarmStreamUnifiedChatWithTools",
-                "json_objects_count": len(json_objects),
-                "json_objects": json_objects,
-                "extracted_texts": [],
-                "raw_size_bytes": len(raw_text)
-            }
-            
             # Extract texts from each JSON object
+            extracted_texts = []
             for idx, obj in enumerate(json_objects):
                 texts = self.extract_text_from_cursor_json(obj)
                 if texts:
-                    doc["extracted_texts"].append({
+                    extracted_texts.append({
                         "object_index": idx,
                         "texts": texts
                     })
             
-            # Insert into MongoDB
-            result = self.mongo_collection.insert_one(doc)
-            if not PRODUCTION_MODE:
-                print(f"   💾 Saved to MongoDB (ID: {result.inserted_id})")
+            # Use MongoDB client's insert_request method with de-duplication
+            result = self.mongo_client.insert_request(
+                session_id=self.session_start,
+                request_num=request_num,
+                timestamp=timestamp,
+                json_objects=json_objects,
+                extracted_texts=extracted_texts,
+                raw_size_bytes=len(raw_text),
+                endpoint=endpoint
+            )
+            
+            if result is None:
+                self._log(f"   ⏭️  Duplicate detected - NOT saved to MongoDB")
             
         except Exception as e:
-            print(f"   ⚠️  MongoDB save failed: {e}")
+            self._log(f"   ⚠️  MongoDB save failed: {e}")
+            # Don't crash the proxy if MongoDB fails
     
     def request(self, flow: http.HTTPFlow) -> None:
-        """Process intercepted HTTP requests"""
-        target_endpoint = "api2.cursor.sh/aiserver.v1.ChatService/WarmStreamUnifiedChatWithTools"
+        """Process intercepted HTTP requests with focused debugging"""
+        # First, log ALL Cursor API requests to help discover new endpoints
+        full_url = f"{flow.request.pretty_host}{flow.request.path}"
         
-        if target_endpoint in f"{flow.request.pretty_host}{flow.request.path}":
-            self.request_count += 1
-            timestamp = datetime.datetime.now()
+        # Check if this is a Cursor API request
+        if "api2.cursor.sh" in flow.request.pretty_host or "cursor.sh" in flow.request.pretty_host:
+            # Print summary of ALL Cursor endpoints to help discovery
+            self._log(f"\n🔍 Cursor API Request Detected:")
+            self._log(f"   Host: {flow.request.pretty_host}")
+            self._log(f"   Path: {flow.request.path}")
+            self._log(f"   Method: {flow.request.method}")
+            self._log(f"   Size: {len(flow.request.content)} bytes")
             
-            # Minimal logging in production
-            if PRODUCTION_MODE:
-                print(f"[{timestamp.strftime('%H:%M:%S')}] Request #{self.request_count} ({len(flow.request.content)} bytes)")
+            # Check if this looks like a chat/AI endpoint (more flexible matching)
+            is_chat_endpoint = any(keyword in flow.request.path.lower() for keyword in [
+                'chat', 'stream', 'unified', 'warmstream', 'aiserver'
+            ])
+            
+            if is_chat_endpoint:
+                self.request_count += 1
+                timestamp = datetime.datetime.now()
+                endpoint = flow.request.path  # Store the actual endpoint path
+                
+                self._log(f"\n🔥 LOGGING REQUEST #{self.request_count} at {timestamp.strftime('%H:%M:%S')}")
+                self._log(f"   Endpoint: {endpoint}")
+                if self.file_logging_enabled:
+                    self._log(f"   💾 Saving: raw (UTF-8), binary (protobuf), clean, JSON")
+                
+                # Decode the request body
+                try:
+                    raw_text = flow.request.content.decode('utf-8', errors='ignore')
+                except Exception as e:
+                    self._log(f"   ❌ Error decoding: {e}")
+                    return
             else:
-                print(f"\n🔥 REQUEST #{self.request_count} at {timestamp.strftime('%H:%M:%S')}")
-                print(f"   Size: {len(flow.request.content)} bytes")
-            
-            # Decode the request body
-            try:
-                raw_text = flow.request.content.decode('utf-8', errors='ignore')
-            except Exception as e:
-                print(f"   ❌ Error decoding: {e}")
+                self._log(f"   ⏩ Skipping (not a chat endpoint)")
                 return
-            
-            # 1. Save RAW log
+        else:
+            # Not a Cursor API request, skip silently
+            return
+        
+        # DEBUG: Check raw text content
+        self._log(f"   🔍 Raw text length: {len(raw_text)}")
+        self._log(f"   🔍 Raw text hash: {hash(raw_text)}")  # Simple hash to verify uniqueness
+        self._log(f"   🔍 First 200 chars: {raw_text[:200]}")
+        self._log(f"   🔍 Last 200 chars: {raw_text[-200:]}")
+        
+        # File logging (conditional based on environment variable)
+        if self.file_logging_enabled:
+            # 1. Save RAW log (decoded UTF-8 with errors ignored)
             with open(self.raw_log, 'a', encoding='utf-8') as f:
                 f.write(f"\n{'='*80}\n")
                 f.write(f"REQUEST #{self.request_count}\n")
                 f.write(f"Timestamp: {timestamp}\n")
-                f.write(f"Endpoint: {flow.request.pretty_host}{flow.request.path}\n")
+                f.write(f"Endpoint: {endpoint}\n")
+                f.write(f"Full URL: {flow.request.pretty_host}{flow.request.path}\n")
                 f.write(f"\nRAW DATA:\n")
                 f.write(raw_text)
                 f.write(f"\n{'='*80}\n\n")
             
-            # 2. Save BINARY log
+            # 1b. Save BINARY log (pure protobuf bytes - no decoding!)
             with open(self.binary_log, 'ab') as f:
+                # Write metadata header
                 header = f"\n{'='*80}\n".encode('utf-8')
                 header += f"REQUEST #{self.request_count}\n".encode('utf-8')
                 header += f"Timestamp: {timestamp}\n".encode('utf-8')
                 header += f"Size: {len(flow.request.content)} bytes\n".encode('utf-8')
                 header += f"{'='*80}\n".encode('utf-8')
                 f.write(header)
+                
+                # Write pure binary protobuf data
                 f.write(flow.request.content)
+                
+                # Write footer
                 footer = f"\n{'='*80}\n\n".encode('utf-8')
                 f.write(footer)
             
-            # 3. Save CLEAN log
+            # 2. Save CLEAN log (working correctly)
             clean_text = self.filter_printable(raw_text)
+            self._log(f"   📝 Clean text length: {len(clean_text)}")
+            
             with open(self.clean_log, 'a', encoding='utf-8') as f:
                 f.write(f"\n{'='*80}\n")
                 f.write(f"REQUEST #{self.request_count}\n")
@@ -230,51 +238,75 @@ class CursorLogger:
                 f.write(clean_text)
                 f.write(f"\n{'='*80}\n\n")
             
-            # 4. Extract JSON objects
-            json_objects = []
-            matches = self.json_regex.findall(raw_text)
-            
-            if not PRODUCTION_MODE:
-                print(f"   🔎 Regex found {len(matches)} potential JSON block(s)")
-            
-            for m in matches:
-                try:
-                    obj = json.loads(m)
-                    json_objects.append(obj)
-                except:
-                    continue
-            
-            # 5. Write extracted JSON
+        # Extract JSON objects (always needed for MongoDB)
+        self._log(f"\n   🔍 Starting JSON extraction via regex...")
+        self._log(f"   🔍 Input text length: {len(raw_text)}")
+        self._log(f"   🔍 Using pattern: {self.json_regex_str}")
+        
+        json_objects = []
+        matches = self.json_regex.findall(raw_text)
+        self._log(f"   🔎 Regex found {len(matches)} potential JSON block(s)")
+        
+        for mi, m in enumerate(matches, 1):
+            preview = m[:100] + ('...' if len(m) > 100 else '')
+            self._log(f"      Candidate #{mi} length={len(m)} preview={preview!r}")
+            try:
+                obj = json.loads(m)
+                json_objects.append(obj)
+                self._log(f"      ✅ Candidate #{mi} parsed as valid JSON")
+            except Exception as e:
+                self._log(f"      ❌ Candidate #{mi} invalid JSON: {e}")
+                continue
+        
+        self._log(f"   📦 Extracted {len(json_objects)} valid JSON object(s) from {len(matches)} match(es)")
+        
+        # Write extracted JSON to the JSON log file (conditional)
+        if self.file_logging_enabled:
             with open(self.json_log, 'a', encoding='utf-8') as jf:
                 jf.write(f"\n{'='*80}\n")
                 jf.write(f"REQUEST #{self.request_count}\n")
                 jf.write(f"Timestamp: {timestamp}\n")
+                jf.write(f"Regex pattern: {self.json_regex_str}\n")
                 jf.write(f"Valid JSON objects: {len(json_objects)}\n\n")
                 for idx, obj in enumerate(json_objects, 1):
                     jf.write(f"-- Object #{idx} --\n")
                     jf.write(json.dumps(obj, ensure_ascii=False, indent=2))
                     jf.write("\n\n")
                 jf.write(f"{'='*80}\n\n")
-            
-            # 6. Save to MongoDB
-            self.save_to_mongodb(self.request_count, timestamp, json_objects, raw_text)
+        
+        # Post-process: extract texts
+        all_texts = []
+        for obj in json_objects:
+            texts = self.extract_text_from_cursor_json(obj)
+            all_texts.extend(texts)
+        
+        self._log(f"   📝 Total texts extracted: {len(all_texts)}")
+        if all_texts:
+            self._log(f"   📝 First text: {all_texts[0][:100] if all_texts[0] else 'empty'}")
+        
+        # Save structured data to MongoDB (if connected)
+        self.save_to_mongodb(self.request_count, timestamp, json_objects, raw_text, endpoint)
     
     def done(self):
         """Cleanup when the proxy stops"""
-        if self.mongo_connected and self.mongo_collection:
+        if self.mongo_client.connected:
             try:
-                self.mongo_collection.insert_one({
-                    "type": "session_end",
-                    "session_id": self.session_start,
-                    "timestamp": datetime.datetime.now(),
-                    "total_requests": self.request_count
-                })
-                print(f"\n📊 Session ended. Total requests logged: {self.request_count}")
-            except:
-                pass
+                # Log session end
+                self.mongo_client.log_session_end(self.session_start, self.request_count)
+                
+                # Get and print session statistics
+                stats = self.mongo_client.get_session_stats(self.session_start)
+                if stats:
+                    self._log(f"\n📊 Session ended. Statistics:")
+                    self._log(f"   Total requests logged: {stats.get('total_requests', 0)}")
+                    self._log(f"   Unique requests saved: {stats.get('unique_requests', 0)}")
+                    self._log(f"   Duplicates prevented: {stats.get('duplicates_prevented', 0)}")
+                else:
+                    self._log(f"\n📊 Session ended. Total requests logged: {self.request_count}")
+            except Exception as e:
+                self._log(f"\n⚠️  Error during cleanup: {e}")
             finally:
-                if self.mongo_client:
-                    self.mongo_client.close()
+                self.mongo_client.close()
 
 # mitmproxy addon
 addons = [CursorLogger()]

@@ -1,7 +1,7 @@
 services:
-  cursor-proxy:
+  cursor-prompt-scraper:
     build: .
-    container_name: cursor-proxy
+    container_name: cursor-prompt-scraper
     restart: unless-stopped
     ports:
       - "8080:8080"
