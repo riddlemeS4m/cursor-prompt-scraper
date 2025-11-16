@@ -1,19 +1,28 @@
 services:
-  cursor-prompt-scraper:
-    build: .
+  cursor-proxy:
+    image: ghcr.io/riddlemes4m/cursor-prompt-scraper:latest
     container_name: cursor-prompt-scraper
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     ports:
       - "8080:8080"
     volumes:
       - ./logs:/app/logs
       - ./certs:/app/certs
     environment:
-      - MONGO_URI=${MONGO_URI}
-      - MONGO_DB=${MONGO_DB:-cursor_logs}
+      # MongoDB Configuration
+      - MONGO_HOST=${MONGO_HOST:-localhost}
+      - MONGO_PORT=${MONGO_PORT:-27017}
+      - MONGO_DB=${MONGO_DB:-prompt_engineering}
       - MONGO_COLLECTION=${MONGO_COLLECTION:-api_requests}
       - MONGO_TIMEOUT_MS=${MONGO_TIMEOUT_MS:-5000}
-      - PRODUCTION_MODE=${PRODUCTION_MODE:-true}
+      - MONGO_USERNAME=${MONGO_USERNAME:-}
+      - MONGO_PASSWORD=${MONGO_PASSWORD:-}
+      - MONGO_AUTH_DB=${MONGO_AUTH_DB:-admin}
+      # Logging Configuration
+      - ENABLE_FILE_LOGGING=${ENABLE_FILE_LOGGING:-true}
+      - ENABLE_CONSOLE_LOGGING=${ENABLE_CONSOLE_LOGGING:-true}
     networks:
       - cursor-net
 
